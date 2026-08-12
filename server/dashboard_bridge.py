@@ -112,7 +112,7 @@ class DashboardBridge:
         position_details_provider: Callable[[], Awaitable[list["PositionDetail"]]] | None = None,
         host: str = "127.0.0.1",
         port: int = 8765,
-        kpi_push_interval_s: float = 2.0,
+        kpi_push_interval_s: float = 5.0,
     ) -> None:
         self._event_bus = event_bus
         self._broker = broker

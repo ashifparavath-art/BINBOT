@@ -113,7 +113,7 @@ class ScannerStrategySettings(BaseSettings):
     price_jump_window_min: int = 20
     funding_trend_window_min: int = 20
 
-    position_monitor_interval_s: float = 2.0
+    position_monitor_interval_s: float = 5.0
     universe_refresh_interval_s: float = 3600.0  # re-fetch the symbol list hourly
 
     @field_validator("leverage")
