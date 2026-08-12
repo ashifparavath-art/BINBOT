@@ -41,6 +41,7 @@ from execution.binance_broker import BinanceFuturesBroker
 from execution.order_manager import OrderLifecycleManager
 from execution.position_monitor import PositionMonitor
 from execution.trade_tracker import TradeTracker
+from notifications.telegram_notifier import TelegramNotifier
 from risk.circuit_breaker import DrawdownCircuitBreaker
 from risk.margin import MarginCalculator, MarginRequirement
 from risk.risk_engine import RiskEngine
@@ -209,6 +210,13 @@ async def main() -> None:
         )
 
     trade_tracker = TradeTracker(broker.get_step_size)
+    notifier = TelegramNotifier(
+        settings.telegram.bot_token.get_secret_value(), settings.telegram.chat_id
+    )
+    if notifier.enabled:
+        logger.info("telegram.enabled")
+    else:
+        logger.info("telegram.disabled", msg="set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to enable")
 
     dashboard_bridge = DashboardBridge(
         event_bus=event_bus,
@@ -228,6 +236,7 @@ async def main() -> None:
         is_strategy_paused=lambda: scanner.is_paused if scanner is not None else False,
         trade_tracker=trade_tracker,
         position_details_provider=broker.get_position_details,
+        notifier=notifier,
         # Different port from the pairs-trading script (8765) so both bots
         # can run — and both be watched on the dashboard — at once.
         port=8766,
@@ -259,15 +268,23 @@ async def main() -> None:
     await universe_feed.backfill(broker.client, universe)
     await universe_feed.start()
 
+    async def on_position_close(symbol: str, reason: str) -> None:
+        # Recorded before the closing order is even submitted, so it's in
+        # place by the time the fill lands and DashboardBridge sends the
+        # Telegram notification — that's what lets that message say
+        # STOP-LOSS/TAKE-PROFIT instead of generic "closed" wording.
+        dashboard_bridge.note_close_reason(symbol, reason)
+        await dashboard_bridge.push_audit(
+            level="risk", source="position_monitor", message=f"{symbol}: {reason}"
+        )
+
     position_monitor = PositionMonitor(
         broker,
         order_manager,
         stop_loss_usdt=sset.stop_loss_usdt,
         take_profit_usdt=sset.take_profit_usdt,
         poll_interval_s=sset.position_monitor_interval_s,
-        on_close_event=lambda symbol, reason: dashboard_bridge.push_audit(
-            level="risk", source="position_monitor", message=f"{symbol}: {reason}"
-        ),
+        on_close_event=on_position_close,
         price_lookup=universe_feed.latest_price,
     )
     position_monitor.start()
@@ -378,13 +395,25 @@ async def main() -> None:
     async def monitor_loop() -> None:
         while not shutdown_event.is_set():
             await asyncio.sleep(5.0)
-            equity = await broker.get_account_equity()
-            for symbol, qty in (await broker.get_positions()).items():
-                risk_engine.update_position(symbol, qty)
-            if circuit_breaker.update(equity):
-                logger.critical("circuit_breaker.tripped_cancelling_all_orders")
-                await order_manager.cancel_all()
-            recovery.persist()
+            try:
+                equity = await broker.get_account_equity()
+                for symbol, qty in (await broker.get_positions()).items():
+                    risk_engine.update_position(symbol, qty)
+                if circuit_breaker.update(equity):
+                    logger.critical("circuit_breaker.tripped_cancelling_all_orders")
+                    await order_manager.cancel_all()
+                recovery.persist()
+            except Exception:
+                # A single failed Binance call here (rate limit, network
+                # blip, timeout) used to kill this task, which tore down
+                # the whole process via the asyncio.wait() below — and
+                # systemd's Restart=always then immediately retried the
+                # same still-failing call, crash-looping (175+ restarts
+                # observed during one Binance rate-limit ban) and likely
+                # extending the ban further with every retry. Log and
+                # back off instead; next iteration tries again in 5s+.
+                logger.exception("monitor_loop.check_failed")
+                await asyncio.sleep(10.0)
 
     try:
         await asyncio.wait(

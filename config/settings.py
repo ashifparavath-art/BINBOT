@@ -139,6 +139,19 @@ class ScannerStrategySettings(BaseSettings):
         return self.margin_usdt * (self.take_profit_roi_pct / 100.0)
 
 
+class TelegramSettings(BaseSettings):
+    """Optional proactive alerts via a Telegram bot: trade opened/closed
+    (with P&L), stop-loss/take-profit triggers, and risk halts. Leave
+    bot_token blank to disable — nothing else in the bot changes."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="TELEGRAM_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    bot_token: SecretStr = SecretStr("")
+    chat_id: str = ""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -151,6 +164,7 @@ class Settings(BaseSettings):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     data: DataSettings = Field(default_factory=DataSettings)
     scanner: ScannerStrategySettings = Field(default_factory=ScannerStrategySettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)
 
     @field_validator("env")
     @classmethod

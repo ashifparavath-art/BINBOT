@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
     from execution.binance_broker import PositionDetail
     from execution.trade_tracker import TradeTracker
+    from notifications.telegram_notifier import TelegramNotifier
 
 AsyncCommandHandler = Callable[[], Awaitable[None]]
 
@@ -110,6 +111,7 @@ class DashboardBridge:
         is_strategy_paused: Callable[[], bool],
         trade_tracker: "TradeTracker | None" = None,
         position_details_provider: Callable[[], Awaitable[list["PositionDetail"]]] | None = None,
+        notifier: "TelegramNotifier | None" = None,
         host: str = "127.0.0.1",
         port: int = 8765,
         kpi_push_interval_s: float = 5.0,
@@ -126,9 +128,11 @@ class DashboardBridge:
         self._is_strategy_paused = is_strategy_paused
         self._trade_tracker = trade_tracker
         self._position_details_provider = position_details_provider
+        self._notifier = notifier
         self._host = host
         self._port = port
         self._kpi_push_interval_s = kpi_push_interval_s
+        self._close_reasons: dict[str, str] = {}
 
         self._commands: dict[str, AsyncCommandHandler] = {
             "pause": on_pause,
@@ -177,6 +181,15 @@ class DashboardBridge:
                 },
             }
         )
+
+    def note_close_reason(self, symbol: str, reason: str) -> None:
+        """Called by the live script's PositionMonitor.on_close_event
+        callback right before it submits a stop-loss/take-profit closing
+        order, so the Telegram notification for the eventual fill can say
+        *why* the position closed (not just that it did). A close that
+        never goes through PositionMonitor — manual flatten, kill switch —
+        has no entry here and falls back to generic wording."""
+        self._close_reasons[symbol] = reason
 
     async def _handle_client(self, connection: "ServerConnection") -> None:
         self._clients.add(connection)
@@ -278,6 +291,8 @@ class DashboardBridge:
                 {"type": "risk", "payload": {"circuitBreakerHalted": True, "haltReason": event.reason}}
             )
             await self.push_audit(level="error", source=event.triggered_by, message=event.reason)
+            if self._notifier is not None:
+                await self._notifier.send(f"🚨 *Circuit breaker tripped*\n{event.reason}")
 
     async def _handle_order_event(self, event: OrderAckEvent | OrderRejectEvent | ExecutionEvent) -> None:
         managed = self._order_manager.get_order(event.order_id)
@@ -323,7 +338,16 @@ class DashboardBridge:
                 message=f"FILLED {event.side.value} {event.fill_quantity} {event.symbol} @ {event.fill_price}",
             )
             if self._trade_tracker is not None:
+                was_open = event.symbol in self._trade_tracker.open_trades()
                 closed = self._trade_tracker.on_execution(event)
+                now_open = event.symbol in self._trade_tracker.open_trades()
+
+                if not was_open and now_open and self._notifier is not None:
+                    await self._notifier.send(
+                        f"🟢 *Opened* {event.side.value} `{event.symbol}`\n"
+                        f"Qty: {event.fill_quantity}  Entry: {event.fill_price}"
+                    )
+
                 if closed is not None:
                     await self._broadcast(
                         {
@@ -346,6 +370,20 @@ class DashboardBridge:
                         source="trade_tracker",
                         message=f"CLOSED {closed.symbol} {closed.side.value} — P&L {closed.pnl:+.2f} USDT",
                     )
+                    if self._notifier is not None:
+                        reason = self._close_reasons.pop(closed.symbol, "")
+                        if reason.startswith("STOP-LOSS"):
+                            label = "🔴 *STOP-LOSS HIT*"
+                        elif reason.startswith("TAKE-PROFIT"):
+                            label = "🟢 *TAKE-PROFIT HIT*"
+                        else:
+                            label = "⚪ *Position closed*"
+                        await self._notifier.send(
+                            f"{label}: `{closed.symbol}`\n"
+                            f"P&L: *{closed.pnl:+.2f} USDT*\n"
+                            f"Entry {closed.entry_price} → Exit {closed.exit_price}\n"
+                            f"Duration: {int(closed.duration_seconds // 60)}m"
+                        )
 
     async def _push_open_trades(self) -> None:
         if self._position_details_provider is None:

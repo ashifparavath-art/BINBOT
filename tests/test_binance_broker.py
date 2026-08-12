@@ -127,3 +127,73 @@ class TestLeverageCapping:
 
         assert broker._configured_leverage_margin["BTCUSDT"] == (2, "ISOLATED")
         client.futures_leverage_bracket.assert_not_called()
+
+
+class TestNativeStopLoss:
+    """A native stop must never let the triggered loss exceed the
+    configured cap — the whole point is a hard ceiling, so the rounding
+    direction (up for a long's stop, down for a short's) is exactly what's
+    under test here, not just that a price was produced."""
+
+    def _mock_client(self, broker: BinanceFuturesBroker) -> AsyncMock:
+        client = AsyncMock()
+        broker._client = client
+        return client
+
+    async def test_long_stop_price_rounds_up_never_exceeding_max_loss(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+        client.futures_create_order.return_value = {"orderId": 555}
+
+        order_id = await broker.place_stop_loss(
+            "BTCUSDT", is_long=True, entry_price=65000.0, quantity_lots=15, max_loss_usdt=200.0
+        )
+
+        assert order_id == "555"
+        call = client.futures_create_order.call_args.kwargs
+        assert call["symbol"] == "BTCUSDT"
+        assert call["side"] == "SELL"  # closes a long
+        assert call["type"] == "STOP_MARKET"
+        assert call["closePosition"] is True
+        real_qty = 15 * 0.001  # BTCUSDT step_size
+        triggered_loss = (65000.0 - call["stopPrice"]) * real_qty
+        assert triggered_loss <= 200.0 + 1e-6
+        assert triggered_loss == pytest.approx(200.0, abs=0.01)  # rounded, not padded far under
+
+    async def test_short_stop_price_rounds_down_never_exceeding_max_loss(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+        client.futures_create_order.return_value = {"orderId": 556}
+
+        order_id = await broker.place_stop_loss(
+            "BTCUSDT", is_long=False, entry_price=65000.0, quantity_lots=15, max_loss_usdt=200.0
+        )
+
+        assert order_id == "556"
+        call = client.futures_create_order.call_args.kwargs
+        assert call["side"] == "BUY"  # closes a short
+        real_qty = 15 * 0.001
+        triggered_loss = (call["stopPrice"] - 65000.0) * real_qty
+        assert triggered_loss <= 200.0 + 1e-6
+        assert triggered_loss == pytest.approx(200.0, abs=0.01)
+
+    async def test_returns_none_and_does_not_raise_when_order_rejected(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+        client.futures_create_order.side_effect = Exception("APIError(code=-2021): Order would immediately trigger")
+
+        order_id = await broker.place_stop_loss(
+            "BTCUSDT", is_long=True, entry_price=65000.0, quantity_lots=15, max_loss_usdt=200.0
+        )
+
+        assert order_id is None
+
+    async def test_returns_none_for_unfiltered_symbol(self, broker: BinanceFuturesBroker):
+        self._mock_client(broker)
+        order_id = await broker.place_stop_loss(
+            "NOSUCHUSDT", is_long=True, entry_price=1.0, quantity_lots=10, max_loss_usdt=50.0
+        )
+        assert order_id is None
+
+    async def test_cancel_does_not_raise_when_already_gone(self, broker: BinanceFuturesBroker):
+        client = self._mock_client(broker)
+        client.futures_cancel_order.side_effect = Exception("APIError(code=-2011): Unknown order sent")
+        await broker.cancel_stop_loss("BTCUSDT", "555")  # must not raise
+        client.futures_cancel_order.assert_awaited_once()

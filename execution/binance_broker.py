@@ -446,6 +446,94 @@ class BinanceFuturesBroker(BrokerInterface):
         except Exception as exc:
             logger.warning("binance.cancel_failed", order_id=order_id, error=str(exc))
 
+    async def place_stop_loss(
+        self,
+        symbol: str,
+        *,
+        is_long: bool,
+        entry_price: float,
+        quantity_lots: int,
+        max_loss_usdt: float,
+    ) -> str | None:
+        """Place a native, exchange-side STOP_MARKET order that closes the
+        entire current position for `symbol` if the mark price crosses the
+        computed stop price — enforced by Binance itself, independent of
+        whether this bot process is even running. This is a backstop, not
+        the primary mechanism: PositionMonitor's own polling (faster, and
+        based on Binance's own live unrealized-P&L figure rather than a
+        static price level) is what normally closes a losing position;
+        this exists for the gap where the bot itself is down (crashed,
+        restarting, the server rebooting) and nothing else is watching.
+
+        The stop price is rounded in whichever direction keeps the
+        triggered loss at or under `max_loss_usdt` — never over it — since
+        the entire point is a hard ceiling on loss, not an approximation.
+        Returns the order id, or None if placement failed (logged, not
+        raised: a failure here must not block the entry itself).
+        """
+        assert self._client is not None
+        filt = self._filters.get(symbol)
+        if filt is None or quantity_lots <= 0:
+            return None
+        real_qty = self.lots_to_quantity(symbol, quantity_lots)
+        if real_qty <= 0:
+            return None
+
+        loss_per_unit = max_loss_usdt / real_qty
+        raw_price = entry_price - loss_per_unit if is_long else entry_price + loss_per_unit
+        tick = filt.tick_size
+        if tick > 0:
+            steps = math.ceil(raw_price / tick) if is_long else math.floor(raw_price / tick)
+            stop_price = round(steps * tick, filt.price_precision)
+        else:
+            stop_price = round(raw_price, filt.price_precision)
+        if stop_price <= 0:
+            logger.warning("binance.native_stop_invalid_price", symbol=symbol, raw_price=raw_price)
+            return None
+
+        close_side = OrderSide.SELL if is_long else OrderSide.BUY
+        client_order_id = f"sl-{symbol}-{int(datetime.now(timezone.utc).timestamp() * 1000)}"[:36]
+        try:
+            result = await self._client.futures_create_order(
+                symbol=symbol,
+                side=close_side.value,
+                type="STOP_MARKET",
+                stopPrice=stop_price,
+                closePosition=True,
+                newClientOrderId=client_order_id,
+                recvWindow=self._recv_window_ms,
+            )
+        except Exception as exc:
+            logger.error("binance.native_stop_failed", symbol=symbol, error=str(exc))
+            return None
+
+        order_id = str(result.get("orderId", client_order_id))
+        logger.info(
+            "binance.native_stop_placed",
+            symbol=symbol,
+            stop_price=stop_price,
+            max_loss_usdt=max_loss_usdt,
+            order_id=order_id,
+        )
+        return order_id
+
+    async def cancel_stop_loss(self, symbol: str, order_id: str) -> None:
+        """Best-effort cancel of a native stop placed by `place_stop_loss`
+        — called once the position it was protecting is closed by some
+        other means (the software take-profit/stop-loss, a manual
+        flatten, a kill switch), so it doesn't sit on the account as a
+        dead order. Safe to call even if Binance already auto-resolved it
+        (e.g. the position closed and the order simply has nothing left
+        to act on) — that failure is expected and only logged quietly."""
+        assert self._client is not None
+        try:
+            await self._client.futures_cancel_order(
+                symbol=symbol, orderId=int(order_id), recvWindow=self._recv_window_ms
+            )
+            logger.info("binance.native_stop_cancelled", symbol=symbol, order_id=order_id)
+        except Exception as exc:
+            logger.debug("binance.native_stop_cancel_failed", symbol=symbol, order_id=order_id, error=str(exc))
+
     async def cancel_all(self) -> None:
         assert self._client is not None
         for symbol in self._symbols:
