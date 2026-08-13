@@ -43,6 +43,7 @@ from execution.position_monitor import PositionMonitor
 from execution.trade_tracker import TradeTracker
 from notifications.telegram_notifier import TelegramNotifier
 from risk.circuit_breaker import DrawdownCircuitBreaker
+from utils.daily_log import DailyJsonlLog
 from risk.margin import MarginCalculator, MarginRequirement
 from risk.risk_engine import RiskEngine
 from server.dashboard_bridge import DashboardBridge, load_or_create_control_token
@@ -237,6 +238,9 @@ async def main() -> None:
         trade_tracker=trade_tracker,
         position_details_provider=broker.get_position_details,
         notifier=notifier,
+        closed_trades_log=DailyJsonlLog("data_store/closed_trades"),
+        audit_log=DailyJsonlLog("data_store/audit_log"),
+        historical_klines_provider=broker.get_mark_price_klines,
         # Different port from the pairs-trading script (8765) so both bots
         # can run — and both be watched on the dashboard — at once.
         port=8766,

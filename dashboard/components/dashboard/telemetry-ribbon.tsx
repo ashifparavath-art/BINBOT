@@ -4,6 +4,7 @@ import type { ElementType } from "react";
 import type { StoreApi, UseBoundStore } from "zustand";
 import { Activity, Radio, Server, Zap } from "lucide-react";
 
+import { isLocalToday } from "@/lib/day";
 import { cn, formatNumber, formatUsd } from "@/lib/utils";
 import type { TradingState } from "@/store/useTradingStore";
 import type { ConnectionState } from "@/lib/types";
@@ -90,6 +91,10 @@ export function TelemetryRibbon({
 }) {
   const status = store((s) => s.status);
   const kpis = store((s) => s.kpis);
+  const closedTrades = store((s) => s.closedTrades);
+
+  const tradesToday = closedTrades.filter((t) => isLocalToday(t.closedAt));
+  const realizedPnlToday = tradesToday.reduce((sum, t) => sum + t.pnl, 0);
 
   const marginPct = kpis.marginLimitUsd > 0 ? (kpis.marginUsedUsd / kpis.marginLimitUsd) * 100 : 0;
 
@@ -119,15 +124,16 @@ export function TelemetryRibbon({
       <div className="flex items-center gap-6">
         <Kpi label="Portfolio Value" value={formatUsd(kpis.portfolioValue)} />
         <Kpi
-          label="Realized P&L"
-          value={formatUsd(kpis.realizedPnl, { signed: true })}
-          tone={kpis.realizedPnl >= 0 ? "profit" : "loss"}
+          label="Realized P&L (Today)"
+          value={formatUsd(realizedPnlToday, { signed: true })}
+          tone={realizedPnlToday >= 0 ? "profit" : "loss"}
         />
         <Kpi
           label="Unrealized P&L"
           value={formatUsd(kpis.unrealizedPnl, { signed: true })}
           tone={kpis.unrealizedPnl >= 0 ? "profit" : "loss"}
         />
+        <Kpi label="Trades Today" value={String(tradesToday.length)} />
         <Kpi label="Sharpe" value={formatNumber(kpis.sharpeRatio, 2)} tone="system" />
         <Kpi
           label="Margin Used"

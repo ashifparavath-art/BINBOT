@@ -13,11 +13,16 @@ import type {
   SystemStatus,
 } from "@/lib/types";
 
-const MAX_AUDIT_EVENTS = 300;
-const MAX_CANDLES_PER_SYMBOL = 240;
+// Raised from the original session-only caps to comfortably hold the ~48h
+// backfill window the backend now replays on connect (see
+// server/dashboard_bridge.py's DailyJsonlLog usage) — these are no longer
+// "how much of this session to remember" but "how much of the recent past
+// to hold in memory," which is a bigger number.
+const MAX_AUDIT_EVENTS = 3000;
+const MAX_CANDLES_PER_SYMBOL = 1600; // ~a day of 1-minute bars
 const MAX_EQUITY_POINTS = 240;
-const MAX_MARKERS_PER_SYMBOL = 100;
-const MAX_CLOSED_TRADES = 200;
+const MAX_MARKERS_PER_SYMBOL = 200;
+const MAX_CLOSED_TRADES = 1500;
 
 export interface TradingState {
   status: SystemStatus;
@@ -50,6 +55,13 @@ export interface TradingState {
   pushAuditEvent: (event: Omit<AuditEvent, "id">) => void;
   setRisk: (risk: Partial<RiskLimits>) => void;
   clearFlash: (orderId: string) => void;
+
+  /** Wholesale-replace, not append — sent once by the backend right after
+   * connecting, before any live push for that connection, so there's no
+   * ordering race with pushClosedTrade/pushAuditEvent/pushCandle. */
+  setClosedTradesBackfill: (trades: ClosedTradeRecord[]) => void;
+  setAuditBackfill: (events: Omit<AuditEvent, "id">[]) => void;
+  setCandlesBackfill: (symbol: string, candles: Candle[]) => void;
 
   togglePauseStrategy: () => void;
   triggerFlatten: () => void;
@@ -135,6 +147,14 @@ export function createTradingStore(): UseBoundStore<StoreApi<TradingState>> {
     pushClosedTrade: (trade) =>
       set((s) => ({ closedTrades: [trade, ...s.closedTrades].slice(0, MAX_CLOSED_TRADES) })),
 
+    setClosedTradesBackfill: (trades) =>
+      set({ closedTrades: [...trades].reverse().slice(0, MAX_CLOSED_TRADES) }),
+
+    setCandlesBackfill: (symbol, candles) =>
+      set((s) => ({
+        candlesBySymbol: { ...s.candlesBySymbol, [symbol]: candles.slice(-MAX_CANDLES_PER_SYMBOL) },
+      })),
+
     clearFlash: (orderId) =>
       set((s) => {
         const rest = { ...s.flashingRows };
@@ -148,6 +168,16 @@ export function createTradingStore(): UseBoundStore<StoreApi<TradingState>> {
         const entry: AuditEvent = { id: `audit-${auditIdCounter}`, ...event };
         return { auditLog: [...s.auditLog, entry].slice(-MAX_AUDIT_EVENTS) };
       }),
+
+    setAuditBackfill: (events) =>
+      set(() => ({
+        // Backend sends these in the same chronological (oldest-first)
+        // order pushAuditEvent already appends in, so no reordering needed.
+        auditLog: events.slice(-MAX_AUDIT_EVENTS).map((event) => {
+          auditIdCounter += 1;
+          return { id: `audit-${auditIdCounter}`, ...event };
+        }),
+      })),
 
     setRisk: (risk) => set((s) => ({ risk: { ...s.risk, ...risk } })),
 

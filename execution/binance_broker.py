@@ -609,6 +609,33 @@ class BinanceFuturesBroker(BrokerInterface):
             )
         return result
 
+    async def get_mark_price_klines(self, symbol: str, limit: int = 1440) -> list[dict]:
+        """Historical 1-minute mark-price candles for the dashboard's chart
+        backfill. Deliberately mark-price klines (not trade klines): the
+        live candle stream the dashboard already gets is itself built from
+        mark-price ticks (see on_tick/BarAggregator in
+        scripts/run_live_binance_scanner.py), so using the same basis here
+        keeps historical and live bars visually continuous instead of
+        showing a seam where one data source hands off to the other.
+        `limit` defaults to 1440 (24h at 1-minute resolution) — Binance
+        allows up to 1500 per call.
+        """
+        assert self._client is not None
+        rows = await self._client.futures_mark_price_klines(
+            symbol=symbol, interval="1m", limit=min(limit, 1500)
+        )
+        return [
+            {
+                "time": int(row[0] / 1000),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": 0.0,  # mark-price klines carry no real trade volume
+            }
+            for row in rows
+        ]
+
     async def get_margin_usage(self) -> tuple[float, float]:
         assert self._client is not None
         account = await self._client.futures_account(recvWindow=self._recv_window_ms)

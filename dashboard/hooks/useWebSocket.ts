@@ -412,6 +412,17 @@ class LiveWebSocketClient {
       case "audit":
         store.pushAuditEvent(msg.payload as Parameters<typeof store.pushAuditEvent>[0]);
         break;
+      case "closed_trades_backfill":
+        store.setClosedTradesBackfill(msg.payload as ClosedTradeRecord[]);
+        break;
+      case "audit_backfill":
+        store.setAuditBackfill(msg.payload as Parameters<typeof store.pushAuditEvent>[0][]);
+        break;
+      case "candles_backfill": {
+        const { symbol, candles } = msg.payload as { symbol: string; candles: Candle[] };
+        store.setCandlesBackfill(symbol, candles);
+        break;
+      }
       default:
         break;
     }

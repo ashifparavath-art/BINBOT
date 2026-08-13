@@ -4,6 +4,7 @@ import type { StoreApi, UseBoundStore } from "zustand";
 
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { isLocalToday } from "@/lib/day";
 import { cn, formatTime, formatUsd } from "@/lib/utils";
 import type { TradingState } from "@/store/useTradingStore";
 
@@ -14,18 +15,19 @@ function formatDuration(seconds: number): string {
 }
 
 export function ClosedTradesTable({ store }: { store: UseBoundStore<StoreApi<TradingState>> }) {
-  const closedTrades = store((s) => s.closedTrades);
+  const allClosedTrades = store((s) => s.closedTrades);
+  const closedTrades = allClosedTrades.filter((t) => isLocalToday(t.closedAt));
 
   return (
     <Card className="h-full">
       <CardHeader>
-        <CardTitle>Closed Trades</CardTitle>
-        <span className="text-[10px] text-slate-500 font-mono">{closedTrades.length} closed</span>
+        <CardTitle>Closed Trades (Today)</CardTitle>
+        <span className="text-[10px] text-slate-500 font-mono">{closedTrades.length} closed today</span>
       </CardHeader>
       <CardContent className="p-0">
         {closedTrades.length === 0 ? (
           <div className="flex items-center justify-center py-10 text-xs text-slate-600 font-sans">
-            No closed trades yet
+            No closed trades yet today
           </div>
         ) : (
           <div className="max-h-[260px] overflow-y-auto scrollbar-thin">

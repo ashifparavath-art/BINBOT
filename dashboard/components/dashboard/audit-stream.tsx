@@ -5,6 +5,7 @@ import type { StoreApi, UseBoundStore } from "zustand";
 import { TerminalSquare } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { isLocalToday } from "@/lib/day";
 import { cn, formatTime } from "@/lib/utils";
 import type { TradingState } from "@/store/useTradingStore";
 import type { AuditLevel } from "@/lib/types";
@@ -28,7 +29,8 @@ const LEVEL_TAG: Record<AuditLevel, string> = {
 };
 
 export function AuditStream({ store }: { store: UseBoundStore<StoreApi<TradingState>> }) {
-  const auditLog = store((s) => s.auditLog);
+  const allAuditLog = store((s) => s.auditLog);
+  const auditLog = allAuditLog.filter((e) => isLocalToday(e.ts));
   const containerRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
 
@@ -50,9 +52,9 @@ export function AuditStream({ store }: { store: UseBoundStore<StoreApi<TradingSt
       <CardHeader className="relative overflow-hidden">
         <div className="flex items-center gap-2">
           <TerminalSquare className="size-3.5 text-system" />
-          <CardTitle>Audit &amp; Risk Event Stream</CardTitle>
+          <CardTitle>Audit &amp; Risk Event Stream (Today)</CardTitle>
         </div>
-        <span className="text-[10px] text-slate-500 font-mono">{auditLog.length} events</span>
+        <span className="text-[10px] text-slate-500 font-mono">{auditLog.length} events today</span>
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px w-1/3 bg-gradient-to-r from-transparent via-system/70 to-transparent animate-scan" />
       </CardHeader>
       <CardContent className="p-0">

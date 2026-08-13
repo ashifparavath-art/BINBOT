@@ -35,6 +35,7 @@ from core.events import BarEvent, Event, ExecutionEvent, OrderAckEvent, OrderRej
 from execution.broker_interface import BrokerInterface
 from execution.order_manager import OrderLifecycleManager
 from risk.circuit_breaker import DrawdownCircuitBreaker
+from utils.daily_log import DailyJsonlLog
 
 if TYPE_CHECKING:
     from websockets.asyncio.server import Server, ServerConnection
@@ -44,6 +45,14 @@ if TYPE_CHECKING:
     from notifications.telegram_notifier import TelegramNotifier
 
 AsyncCommandHandler = Callable[[], Awaitable[None]]
+
+# Generous in-memory ceilings for the recent-history lists backing new-client
+# backfill — bounded mainly so a very-long-uptime process (no restart across
+# many days) can't grow these forever; disk rotation in DailyJsonlLog is the
+# real bound on how much history exists at all.
+_MAX_RECENT_CLOSED_TRADES = 2000
+_MAX_RECENT_AUDIT_EVENTS = 5000
+_MAX_CANDLES_PER_SYMBOL_CACHE = 1600
 
 
 def load_or_create_control_token(path: str = "data_store/dashboard_control_token.txt") -> str:
@@ -112,6 +121,9 @@ class DashboardBridge:
         trade_tracker: "TradeTracker | None" = None,
         position_details_provider: Callable[[], Awaitable[list["PositionDetail"]]] | None = None,
         notifier: "TelegramNotifier | None" = None,
+        closed_trades_log: "DailyJsonlLog | None" = None,
+        audit_log: "DailyJsonlLog | None" = None,
+        historical_klines_provider: Callable[[str, int], Awaitable[list[dict]]] | None = None,
         host: str = "127.0.0.1",
         port: int = 8765,
         kpi_push_interval_s: float = 5.0,
@@ -129,10 +141,23 @@ class DashboardBridge:
         self._trade_tracker = trade_tracker
         self._position_details_provider = position_details_provider
         self._notifier = notifier
+        self._closed_trades_log = closed_trades_log
+        self._audit_log = audit_log
+        self._historical_klines_provider = historical_klines_provider
         self._host = host
         self._port = port
         self._kpi_push_interval_s = kpi_push_interval_s
         self._close_reasons: dict[str, str] = {}
+
+        # Backing store for new-client backfill — "today" as seen by a
+        # dashboard viewer is computed client-side in their own local
+        # timezone (see dashboard/lib/day.ts); these just need to hold a
+        # window generous enough to cover that regardless of server
+        # timezone, which DailyJsonlLog.read_recent()'s default already is.
+        self._closed_trades_recent: list[dict[str, Any]] = []
+        self._audit_recent: list[dict[str, Any]] = []
+        self._candles_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        self._backfilled_symbols: set[str] = set()
 
         self._commands: dict[str, AsyncCommandHandler] = {
             "pause": on_pause,
@@ -150,10 +175,21 @@ class DashboardBridge:
     async def start(self) -> None:
         import websockets
 
+        if self._closed_trades_log is not None:
+            self._closed_trades_recent = self._closed_trades_log.read_recent()
+        if self._audit_log is not None:
+            self._audit_recent = self._audit_log.read_recent()
+
         self._server = await websockets.serve(self._handle_client, self._host, self._port)
         self._event_bus.subscribe_all(self._on_event)
         self._kpi_task = asyncio.create_task(self._kpi_loop(), name="dashboard-bridge-kpi")
-        logger.info("dashboard_bridge.started", host=self._host, port=self._port)
+        logger.info(
+            "dashboard_bridge.started",
+            host=self._host,
+            port=self._port,
+            recovered_closed_trades=len(self._closed_trades_recent),
+            recovered_audit_events=len(self._audit_recent),
+        )
 
     async def stop(self) -> None:
         if self._kpi_task:
@@ -168,19 +204,16 @@ class DashboardBridge:
     ) -> None:
         """Ad-hoc audit line for callers outside the event bus (e.g. the
         live script's own risk-check logging), so the dashboard sees the
-        same approve/reject narrative an operator sees in the terminal."""
-        await self._broadcast(
-            {
-                "type": "audit",
-                "payload": {
-                    "ts": _now_ms(),
-                    "level": level,
-                    "source": source,
-                    "message": message,
-                    "meta": meta or {},
-                },
-            }
-        )
+        same approve/reject narrative an operator sees in the terminal.
+        Every audit line — from any source — funnels through here, which is
+        what makes this the single place to persist the day's full stream."""
+        payload = {"ts": _now_ms(), "level": level, "source": source, "message": message, "meta": meta or {}}
+        self._audit_recent.append(payload)
+        if len(self._audit_recent) > _MAX_RECENT_AUDIT_EVENTS:
+            del self._audit_recent[: len(self._audit_recent) - _MAX_RECENT_AUDIT_EVENTS]
+        if self._audit_log is not None:
+            self._audit_log.append(payload)
+        await self._broadcast({"type": "audit", "payload": payload})
 
     def note_close_reason(self, symbol: str, reason: str) -> None:
         """Called by the live script's PositionMonitor.on_close_event
@@ -194,6 +227,7 @@ class DashboardBridge:
     async def _handle_client(self, connection: "ServerConnection") -> None:
         self._clients.add(connection)
         logger.info("dashboard_bridge.client_connected", total_clients=len(self._clients))
+        await self._send_backfill(connection)
         try:
             async for raw in connection:
                 await self._handle_incoming(raw)
@@ -202,6 +236,37 @@ class DashboardBridge:
         finally:
             self._clients.discard(connection)
             logger.info("dashboard_bridge.client_disconnected", total_clients=len(self._clients))
+
+    async def _send_backfill(self, connection: "ServerConnection") -> None:
+        """Catches a freshly-connected tab up on history it would otherwise
+        never see — closed trades and audit events survive a bot restart
+        via disk (DailyJsonlLog); candles are held in-memory only per
+        symbol, refreshed from Binance the first time each symbol needs
+        charting (see the BarEvent branch of _on_event). Sent once, before
+        this connection's message loop starts, so it can never race with a
+        live broadcast for the same connection."""
+        try:
+            if self._closed_trades_recent:
+                await connection.send(
+                    json.dumps(
+                        {"type": "closed_trades_backfill", "payload": self._closed_trades_recent}, default=str
+                    )
+                )
+            if self._audit_recent:
+                await connection.send(
+                    json.dumps({"type": "audit_backfill", "payload": self._audit_recent}, default=str)
+                )
+            for symbol, candles in self._candles_by_symbol.items():
+                if not candles:
+                    continue
+                await connection.send(
+                    json.dumps(
+                        {"type": "candles_backfill", "payload": {"symbol": symbol, "candles": candles}},
+                        default=str,
+                    )
+                )
+        except Exception:
+            logger.debug("dashboard_bridge.backfill_send_failed")
 
     async def _handle_incoming(self, raw: str | bytes) -> None:
         try:
@@ -263,20 +328,25 @@ class DashboardBridge:
         if isinstance(event, BarEvent):
             if not self._wants_chart_for(event.symbol):
                 return
-            await self._broadcast(
-                {
-                    "type": "candle",
-                    "payload": {
-                        "symbol": event.symbol,
-                        "time": int(event.ts.timestamp()),
-                        "open": event.open,
-                        "high": event.high,
-                        "low": event.low,
-                        "close": event.close,
-                        "volume": event.volume,
-                    },
-                }
-            )
+            await self._backfill_candles_once(event.symbol)
+
+            candle_payload = {
+                "symbol": event.symbol,
+                "time": int(event.ts.timestamp()),
+                "open": event.open,
+                "high": event.high,
+                "low": event.low,
+                "close": event.close,
+                "volume": event.volume,
+            }
+            cache = self._candles_by_symbol.setdefault(event.symbol, [])
+            if cache and cache[-1]["time"] == candle_payload["time"]:
+                cache[-1] = candle_payload
+            else:
+                cache.append(candle_payload)
+                if len(cache) > _MAX_CANDLES_PER_SYMBOL_CACHE:
+                    del cache[0]
+            await self._broadcast({"type": "candle", "payload": candle_payload})
         elif isinstance(event, SignalEvent):
             await self.push_audit(
                 level="signal",
@@ -293,6 +363,26 @@ class DashboardBridge:
             await self.push_audit(level="error", source=event.triggered_by, message=event.reason)
             if self._notifier is not None:
                 await self._notifier.send(f"🚨 *Circuit breaker tripped*\n{event.reason}")
+
+    async def _backfill_candles_once(self, symbol: str) -> None:
+        """The first time a symbol needs charting (it's the fixed
+        chart_symbol, or a position just opened on it), fetch its recent
+        history from Binance and broadcast it once so charts open already
+        populated instead of starting from a single live bar. A no-op on
+        every subsequent bar for that symbol — cheap to call unconditionally
+        from the BarEvent hot path."""
+        if symbol in self._backfilled_symbols or self._historical_klines_provider is None:
+            return
+        self._backfilled_symbols.add(symbol)
+        try:
+            candles = await self._historical_klines_provider(symbol, _MAX_CANDLES_PER_SYMBOL_CACHE)
+        except Exception:
+            logger.exception("dashboard_bridge.klines_backfill_failed", symbol=symbol)
+            return
+        if not candles:
+            return
+        self._candles_by_symbol[symbol] = candles[-_MAX_CANDLES_PER_SYMBOL_CACHE:]
+        await self._broadcast({"type": "candles_backfill", "payload": {"symbol": symbol, "candles": candles}})
 
     async def _handle_order_event(self, event: OrderAckEvent | OrderRejectEvent | ExecutionEvent) -> None:
         managed = self._order_manager.get_order(event.order_id)
@@ -349,22 +439,23 @@ class DashboardBridge:
                     )
 
                 if closed is not None:
-                    await self._broadcast(
-                        {
-                            "type": "closed_trade",
-                            "payload": {
-                                "symbol": closed.symbol,
-                                "side": closed.side.value,
-                                "quantity": closed.quantity,
-                                "entryPrice": closed.entry_price,
-                                "exitPrice": closed.exit_price,
-                                "pnl": closed.pnl,
-                                "openedAt": int(closed.entry_ts.timestamp() * 1000),
-                                "closedAt": int(closed.exit_ts.timestamp() * 1000),
-                                "durationSec": closed.duration_seconds,
-                            },
-                        }
-                    )
+                    closed_payload = {
+                        "symbol": closed.symbol,
+                        "side": closed.side.value,
+                        "quantity": closed.quantity,
+                        "entryPrice": closed.entry_price,
+                        "exitPrice": closed.exit_price,
+                        "pnl": closed.pnl,
+                        "openedAt": int(closed.entry_ts.timestamp() * 1000),
+                        "closedAt": int(closed.exit_ts.timestamp() * 1000),
+                        "durationSec": closed.duration_seconds,
+                    }
+                    self._closed_trades_recent.append(closed_payload)
+                    if len(self._closed_trades_recent) > _MAX_RECENT_CLOSED_TRADES:
+                        del self._closed_trades_recent[: len(self._closed_trades_recent) - _MAX_RECENT_CLOSED_TRADES]
+                    if self._closed_trades_log is not None:
+                        self._closed_trades_log.append(closed_payload)
+                    await self._broadcast({"type": "closed_trade", "payload": closed_payload})
                     await self.push_audit(
                         level="fill" if closed.pnl >= 0 else "risk",
                         source="trade_tracker",
@@ -418,7 +509,31 @@ class DashboardBridge:
         if self._starting_equity is None:
             self._starting_equity = equity
         initial_margin, _ = await self._broker.get_margin_usage()
-        positions = await self._broker.get_positions()
+
+        # Prefer position_details_provider (one call gives both the
+        # per-position unrealized P&L we need here AND the size used for
+        # positionContractsUsed below) over the plain get_positions() call,
+        # so this loop doesn't make two separate broker round-trips for
+        # overlapping data. Falls back to 0 unrealized P&L only if no
+        # provider was wired up (e.g. an older/minimal caller).
+        if self._position_details_provider is not None:
+            details = await self._position_details_provider()
+            unrealized_pnl = sum(d.unrealized_pnl for d in details)
+            position_contracts_used = sum(abs(d.quantity) for d in details)
+        else:
+            positions = await self._broker.get_positions()
+            unrealized_pnl = 0.0
+            position_contracts_used = sum(abs(q) for q in positions.values())
+
+        # Realized P&L = actual sum of closed-trade P&L (previously
+        # hardcoded to 0.0 while the equity-delta figure — which mixes
+        # BOTH realized and unrealized — was mislabeled "unrealized").
+        # This is the bridge's own all-time-this-process fallback; the
+        # dashboard's headline tile instead sums today's (locally-scoped)
+        # closed trades client-side from the same backfilled list, see
+        # dashboard/components/dashboard/telemetry-ribbon.tsx.
+        realized_pnl = sum(t["pnl"] for t in self._closed_trades_recent)
+        total_pnl = realized_pnl + unrealized_pnl
 
         await self._broadcast(
             {
@@ -431,18 +546,13 @@ class DashboardBridge:
                 },
             }
         )
-        # Simplification: this bridge reports total P&L since it started as
-        # "unrealized" rather than querying the exchange for a true
-        # realized/unrealized split — good enough for a live monitoring
-        # view, not a substitute for the exchange's own statements.
-        pnl_since_start = equity - self._starting_equity
         await self._broadcast(
             {
                 "type": "kpis",
                 "payload": {
                     "portfolioValue": equity,
-                    "realizedPnl": 0.0,
-                    "unrealizedPnl": pnl_since_start,
+                    "realizedPnl": realized_pnl,
+                    "unrealizedPnl": unrealized_pnl,
                     "sharpeRatio": 0.0,
                     "marginUsedUsd": initial_margin,
                     "marginLimitUsd": equity,
@@ -465,9 +575,9 @@ class DashboardBridge:
                 "type": "risk",
                 "payload": {
                     "maxDailyLossUsd": self._max_daily_loss_usd,
-                    "dailyLossUsedUsd": max(0.0, -pnl_since_start),
+                    "dailyLossUsedUsd": max(0.0, -total_pnl),
                     "maxPositionContracts": self._max_position_contracts,
-                    "positionContractsUsed": sum(abs(q) for q in positions.values()),
+                    "positionContractsUsed": position_contracts_used,
                     "strategyPaused": self._is_strategy_paused(),
                     "circuitBreakerHalted": self._circuit_breaker.is_halted,
                     "haltReason": self._circuit_breaker.halt_reason or None,
