@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -107,7 +107,19 @@ class ScannerStrategySettings(BaseSettings):
     # account, not just the ~3.3 USDT margin backing this one position.
     margin_type: str = "CROSSED"
     stop_loss_usdt: float = 200.0
-    take_profit_roi_pct: float = 30.0  # measured against margin_usdt, i.e. ROE%
+
+    # Profit exit is a trailing stop, not a fixed target: once unrealized
+    # ROI (against margin_usdt) first reaches trailing_profit_arm_roi_pct, a
+    # stop arms at trailing_profit_base_roi_pct and rises
+    # trailing_profit_step_roi_pct for every additional
+    # trailing_profit_step_increment_roi_pct of peak profit reached after
+    # that. Position closes once ROI pulls back down to whatever that
+    # trailing level currently is -- see execution/position_monitor.py.
+    trailing_profit_arm_roi_pct: float = 80.0
+    trailing_profit_base_roi_pct: float = 75.0
+    trailing_profit_step_roi_pct: float = 2.0
+    trailing_profit_step_increment_roi_pct: float = 5.0
+    trailing_profit_max_gap_roi_pct: float = 0.0
 
     price_jump_pct: float = 10.0
     price_jump_window_min: int = 20
@@ -130,13 +142,23 @@ class ScannerStrategySettings(BaseSettings):
             raise ValueError("max_open_positions must be at least 1")
         return v
 
+    @field_validator("trailing_profit_step_increment_roi_pct")
+    @classmethod
+    def _validate_step_increment(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("trailing_profit_step_increment_roi_pct must be positive")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_trailing_base_below_arm(self) -> "ScannerStrategySettings":
+        if self.trailing_profit_base_roi_pct > self.trailing_profit_arm_roi_pct:
+            raise ValueError("trailing_profit_base_roi_pct must not exceed trailing_profit_arm_roi_pct")
+        return self
+
     @property
     def order_notional_usdt(self) -> float:
         return self.margin_usdt * self.leverage
 
-    @property
-    def take_profit_usdt(self) -> float:
-        return self.margin_usdt * (self.take_profit_roi_pct / 100.0)
 
 
 class TelegramSettings(BaseSettings):

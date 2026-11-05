@@ -46,6 +46,17 @@ class EventBus:
         self._dispatch_task = asyncio.create_task(self._dispatch_loop(), name="event-bus-dispatch")
         logger.info("event_bus.started", redis_enabled=bool(self._redis))
 
+    async def is_redis_connected(self) -> bool:
+        """Live PING check, not just whether a client was constructed at
+        startup -- lets callers (e.g. the dashboard status bar) reflect
+        Redis going down mid-session rather than trusting a stale flag."""
+        if self._redis is None:
+            return False
+        try:
+            return bool(await self._redis.ping())
+        except Exception:
+            return False
+
     async def stop(self) -> None:
         self._running = False
         if self._dispatch_task:

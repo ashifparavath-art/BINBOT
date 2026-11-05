@@ -540,7 +540,7 @@ class DashboardBridge:
                 "type": "status",
                 "payload": {
                     "broker": "connected" if self._broker.is_connected else "disconnected",
-                    "redis": "disconnected",  # this bridge talks directly over WebSocket, not Redis
+                    "redis": "connected" if await self._event_bus.is_redis_connected() else "disconnected",
                     "engine": "connected",
                     "latencyMs": 0,
                 },

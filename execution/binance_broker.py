@@ -401,6 +401,8 @@ class BinanceFuturesBroker(BrokerInterface):
             "newClientOrderId": client_order_id,
             "recvWindow": self._recv_window_ms,
         }
+        if request.reduce_only:
+            params["reduceOnly"] = "true"
         if request.order_type is OrderType.LIMIT:
             if request.limit_price is None:
                 raise ValueError("LIMIT order requires limit_price")
@@ -500,6 +502,7 @@ class BinanceFuturesBroker(BrokerInterface):
                 type="STOP_MARKET",
                 stopPrice=stop_price,
                 closePosition=True,
+                workingType="MARK_PRICE",
                 newClientOrderId=client_order_id,
                 recvWindow=self._recv_window_ms,
             )
@@ -533,6 +536,71 @@ class BinanceFuturesBroker(BrokerInterface):
             logger.info("binance.native_stop_cancelled", symbol=symbol, order_id=order_id)
         except Exception as exc:
             logger.debug("binance.native_stop_cancel_failed", symbol=symbol, order_id=order_id, error=str(exc))
+
+    async def place_take_profit(
+        self,
+        symbol: str,
+        *,
+        is_long: bool,
+        entry_price: float,
+        quantity_lots: int,
+        take_profit_usdt: float,
+    ) -> str | None:
+        """Place a native, exchange-side TAKE_PROFIT_MARKET order."""
+        assert self._client is not None
+        filt = self._filters.get(symbol)
+        if filt is None or quantity_lots <= 0:
+            return None
+        real_qty = self.lots_to_quantity(symbol, quantity_lots)
+        if real_qty <= 0:
+            return None
+        profit_per_unit = take_profit_usdt / real_qty
+        raw_price = entry_price + profit_per_unit if is_long else entry_price - profit_per_unit
+        tick = filt.tick_size
+        if tick > 0:
+            steps = math.ceil(raw_price / tick) if is_long else math.floor(raw_price / tick)
+            target_price = round(steps * tick, filt.price_precision)
+        else:
+            target_price = round(raw_price, filt.price_precision)
+        if target_price <= 0:
+            logger.warning("binance.native_tp_invalid_price", symbol=symbol, raw_price=raw_price)
+            return None
+        close_side = OrderSide.SELL if is_long else OrderSide.BUY
+        client_order_id = f"tp-{symbol}-{int(datetime.now(timezone.utc).timestamp() * 1000)}"[:36]
+        try:
+            result = await self._client.futures_create_order(
+                symbol=symbol,
+                side=close_side.value,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=target_price,
+                closePosition=True,
+                workingType="MARK_PRICE",
+                newClientOrderId=client_order_id,
+                recvWindow=self._recv_window_ms,
+            )
+        except Exception as exc:
+            logger.error("binance.native_tp_failed", symbol=symbol, error=str(exc))
+            return None
+        order_id = str(result.get("orderId", client_order_id))
+        logger.info(
+            "binance.native_tp_placed",
+            symbol=symbol,
+            target_price=target_price,
+            take_profit_usdt=take_profit_usdt,
+            order_id=order_id,
+        )
+        return order_id
+
+    async def cancel_take_profit(self, symbol: str, order_id: str) -> None:
+        """Best-effort cancel of a native TP placed by place_take_profit."""
+        assert self._client is not None
+        try:
+            await self._client.futures_cancel_order(
+                symbol=symbol, orderId=int(order_id), recvWindow=self._recv_window_ms
+            )
+            logger.info("binance.native_tp_cancelled", symbol=symbol, order_id=order_id)
+        except Exception as exc:
+            logger.debug("binance.native_tp_cancel_failed", symbol=symbol, order_id=order_id, error=str(exc))
 
     async def cancel_all(self) -> None:
         assert self._client is not None

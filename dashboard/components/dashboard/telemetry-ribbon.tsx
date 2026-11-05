@@ -134,6 +134,15 @@ export function TelemetryRibbon({
           tone={kpis.unrealizedPnl >= 0 ? "profit" : "loss"}
         />
         <Kpi label="Trades Today" value={String(tradesToday.length)} />
+        <Kpi
+          label="Win Rate"
+          value={
+            tradesToday.length > 0
+              ? `${formatNumber((tradesToday.filter((t) => t.pnl > 0).length / tradesToday.length) * 100, 0)}%`
+              : "—"
+          }
+          tone="system"
+        />
         <Kpi label="Sharpe" value={formatNumber(kpis.sharpeRatio, 2)} tone="system" />
         <Kpi
           label="Margin Used"

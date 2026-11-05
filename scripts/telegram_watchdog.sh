@@ -28,7 +28,7 @@ fi
 # full login environment (User=/PAMName=), so referencing it under `set -u`
 # fails with "HOME: unbound variable" the moment this runs as a service.
 STATE_FILE="${BINBOT_WATCHDOG_STATE_FILE:-data_store/watchdog_state.txt}"
-SERVICES=(binbot-scanner binbot-dashboard)
+SERVICES=(binbot2-atr binbot-dashboard)  # was binbot-scanner (funding-momentum), replaced by binbot2 ATR
 
 send_alert() {
     curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \

@@ -25,6 +25,7 @@ class BrokerOrderRequest:
     time_in_force: TimeInForce
     oca_group: str | None = None
     oca_type: int = 1  # IBKR OCA type 1 = cancel all remaining on any fill
+    reduce_only: bool = False
 
 
 class BrokerInterface(abc.ABC):

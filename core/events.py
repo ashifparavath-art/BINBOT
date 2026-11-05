@@ -105,6 +105,7 @@ class SignalEvent(Event):
     time_in_force: TimeInForce = TimeInForce.DAY
     correlation_id: str = field(default_factory=_new_id)
     oca_group: str | None = None
+    reduce_only: bool = False
     metadata: dict[str, float | str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

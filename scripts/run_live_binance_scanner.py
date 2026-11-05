@@ -105,7 +105,7 @@ async def main() -> None:
     await broker.load_all_filters()
     logger.info("startup.universe_loaded", symbol_count=len(universe))
 
-    event_bus = EventBus()
+    event_bus = EventBus(redis_url=settings.data.redis_url)
     # Separate DB file from the pairs-trading script's default path — DuckDB
     # doesn't allow two processes to hold the same file open concurrently,
     # and both live scripts now run at once (one per dashboard tab).
@@ -286,9 +286,15 @@ async def main() -> None:
         broker,
         order_manager,
         stop_loss_usdt=sset.stop_loss_usdt,
-        take_profit_usdt=sset.take_profit_usdt,
+        margin_usdt=sset.margin_usdt,
+        trailing_profit_arm_roi_pct=sset.trailing_profit_arm_roi_pct,
+        trailing_profit_base_roi_pct=sset.trailing_profit_base_roi_pct,
+        trailing_profit_step_roi_pct=sset.trailing_profit_step_roi_pct,
+        trailing_profit_step_increment_roi_pct=sset.trailing_profit_step_increment_roi_pct,
+        trailing_profit_max_gap_roi_pct=sset.trailing_profit_max_gap_roi_pct,
         poll_interval_s=sset.position_monitor_interval_s,
         on_close_event=on_position_close,
+        event_bus=event_bus,
         price_lookup=universe_feed.latest_price,
     )
     position_monitor.start()
@@ -351,31 +357,38 @@ async def main() -> None:
 
     async def on_signal(event: Event) -> None:
         assert isinstance(event, SignalEvent)
-        account_equity = await broker.get_account_equity()
-        positions = await broker.get_positions()
-        gross_exposure_usd = sum(
-            abs(qty) * last_price.get(sym, 0.0) * broker.get_step_size(sym)
-            for sym, qty in positions.items()
-        )
-        initial_margin, maintenance_margin = await broker.get_margin_usage()
-        result = risk_engine.check_order(
-            event,
-            account_equity=account_equity,
-            gross_exposure_usd=gross_exposure_usd,
-            current_initial_margin_used=initial_margin,
-            current_maintenance_margin_used=maintenance_margin,
-        )
-        if not result.passed:
-            await dashboard_bridge.push_audit(
-                level="risk", source="risk_engine", message=f"REJECTED [{result.code}] {result.message}"
+        try:
+            account_equity = await broker.get_account_equity()
+            positions = await broker.get_positions()
+            gross_exposure_usd = sum(
+                abs(qty) * last_price.get(sym, 0.0) * broker.get_step_size(sym)
+                for sym, qty in positions.items()
             )
-            return
-        await dashboard_bridge.push_audit(level="risk", source="risk_engine", message="pre-trade checks passed")
-        # Only NOW — right before actually submitting — do we make the real
-        # Binance API calls to set this symbol's leverage/margin type. Most
-        # of the ~300-symbol universe will never reach this line.
-        await broker.ensure_symbol_ready(event.symbol, leverage=sset.leverage, margin_type=sset.margin_type)
-        await order_manager.submit(event, expected_price=last_price.get(event.symbol))
+            initial_margin, maintenance_margin = await broker.get_margin_usage()
+            result = risk_engine.check_order(
+                event,
+                account_equity=account_equity,
+                gross_exposure_usd=gross_exposure_usd,
+                current_initial_margin_used=initial_margin,
+                current_maintenance_margin_used=maintenance_margin,
+            )
+            if not result.passed:
+                await dashboard_bridge.push_audit(
+                    level="risk", source="risk_engine", message=f"REJECTED [{result.code}] {result.message}"
+                )
+                return
+            await dashboard_bridge.push_audit(level="risk", source="risk_engine", message="pre-trade checks passed")
+            # Only NOW — right before actually submitting — do we make the real
+            # Binance API calls to set this symbol's leverage/margin type. Most
+            # of the ~300-symbol universe will never reach this line.
+            await broker.ensure_symbol_ready(event.symbol, leverage=sset.leverage, margin_type=sset.margin_type)
+            await order_manager.submit(event, expected_price=last_price.get(event.symbol))
+        except Exception:
+            # Mirrors monitor_loop's fix: a single failed Binance call here
+            # (rate limit, network blip, timeout) used to kill this signal
+            # handler and could tear down the whole process. Log and skip
+            # this signal instead — the next signal will retry.
+            logger.exception("on_signal.check_failed")
 
     event_bus.subscribe(EventType.SIGNAL, on_signal)
 

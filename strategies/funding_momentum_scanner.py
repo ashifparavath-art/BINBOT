@@ -71,10 +71,10 @@ def evaluate_entry(
 
     if price_change_pct >= price_jump_pct:
         if funding_now < funding_window_start:  # trending MORE negative
-            return OrderSide.BUY
+            return OrderSide.SELL
     elif price_change_pct <= -price_jump_pct:
         if funding_window_start < 0 and funding_now > funding_window_start:  # started negative, rising since
-            return OrderSide.SELL
+            return OrderSide.BUY
     return None
 
 
@@ -121,6 +121,13 @@ class FundingMomentumScannerStrategy(BaseStrategy):
             price_jump_pct=self._params.price_jump_pct,
         )
         if side is None:
+            logger.debug(
+                "scanner.no_setup",
+                symbol=symbol,
+                price_change_pct=price_change_pct,
+                funding_now=funding_now,
+                funding_window_start=funding_window_start,
+            )
             return
 
         step_size = self._step_size_lookup(symbol)

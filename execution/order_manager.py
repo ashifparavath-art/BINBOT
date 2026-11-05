@@ -104,6 +104,7 @@ class OrderLifecycleManager:
             limit_price=signal.limit_price,
             time_in_force=signal.time_in_force,
             oca_group=signal.oca_group,
+            reduce_only=signal.reduce_only,
         )
         logger.info(
             "order_manager.submitting",

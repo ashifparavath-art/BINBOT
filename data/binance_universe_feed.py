@@ -48,6 +48,7 @@ class BinanceUniverseFeed:
         funding_window_min: float = 30.0,
         reconnect_backoff_s: float = 2.0,
         reconnect_backoff_max_s: float = 60.0,
+        rest_poll_interval_s: float = 5.0,
     ) -> None:
         self._bsm = socket_manager
         self._event_bus = event_bus
@@ -62,16 +63,25 @@ class BinanceUniverseFeed:
         self._connected = False
         self._task: asyncio.Task[None] | None = None
         self._message_count = 0
+        self._rest_poll_interval_s = rest_poll_interval_s
+        self._client: "AsyncClient | None" = None
+        self._rest_poll_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self._connected = True
         self._task = asyncio.create_task(self._stream(), name="binance-universe-feed")
+        if self._client is not None:
+            self._rest_poll_task = asyncio.create_task(
+                self._rest_poll_loop(), name="binance-universe-feed-rest-fallback"
+            )
         logger.info("universe_feed.started")
 
     async def stop(self) -> None:
         self._connected = False
         if self._task is not None:
             self._task.cancel()
+        if self._rest_poll_task is not None:
+            self._rest_poll_task.cancel()
 
     async def backfill(self, client: "AsyncClient", symbols: list[str], *, concurrency: int = 15) -> None:
         """Seed price/funding history from historical klines, covering the
@@ -86,6 +96,7 @@ class BinanceUniverseFeed:
         is the basis that predicted rate is computed from, so its kline
         history is the closest available stand-in.
         """
+        self._client = client
         price_limit = max(2, math.ceil(self._price_window.total_seconds() / 60) + 1)
         funding_limit = max(2, math.ceil(self._funding_window.total_seconds() / 60) + 1)
         sem = asyncio.Semaphore(concurrency)
@@ -152,7 +163,14 @@ class BinanceUniverseFeed:
                 async with self._bsm.all_mark_price_socket(fast=True) as stream:
                     backoff = self._reconnect_backoff_s
                     while self._connected:
-                        msg = await stream.recv()
+                        try:
+                            msg = await asyncio.wait_for(stream.recv(), timeout=30.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "universe_feed.recv_timeout",
+                                msg="no message in 30s, forcing reconnect",
+                            )
+                            break
                         await self._handle_message(msg)
             except asyncio.CancelledError:
                 raise
@@ -195,6 +213,56 @@ class BinanceUniverseFeed:
         self._message_count += 1
         if self._message_count % 300 == 0:  # roughly every 5 minutes at 1 msg/s
             logger.info("universe_feed.heartbeat", symbols_tracked=len(self._latest_price))
+
+    async def _rest_poll_loop(self) -> None:
+        """Fallback path for when the websocket stream isn't delivering
+        data (seen on testnet: handshake succeeds but no messages ever
+        arrive). Polls the mark-price REST endpoint with no `symbol` arg,
+        which returns every symbol in a single request — cheap enough to
+        run continuously alongside the websocket as a safety net, since
+        duplicate updates are harmless to the rolling windows and
+        downstream strategy.
+        """
+        backoff = self._reconnect_backoff_s
+        while self._connected:
+            try:
+                rows = await self._client.futures_mark_price()
+                await self._handle_rest_snapshot(rows)
+                backoff = self._reconnect_backoff_s
+                await asyncio.sleep(self._rest_poll_interval_s)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("universe_feed.rest_poll_error", error=str(exc), retry_in_s=backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self._reconnect_backoff_max_s)
+
+    async def _handle_rest_snapshot(self, rows: list[dict[str, Any]]) -> None:
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            try:
+                symbol = row["symbol"]
+                price = float(row["markPrice"])
+                funding_rate = float(row["lastFundingRate"])
+            except (KeyError, ValueError, TypeError):
+                continue
+
+            self._append_trimmed(self._price_history[symbol], now, price, self._price_window)
+            self._append_trimmed(self._funding_history[symbol], now, funding_rate, self._funding_window)
+            self._latest_price[symbol] = price
+
+            await self._event_bus.publish(
+                TickEvent(
+                    ts=now,
+                    symbol=symbol,
+                    bid=price,
+                    ask=price,
+                    bid_size=0,
+                    ask_size=0,
+                    last=price,
+                    last_size=0,
+                )
+            )
 
     @staticmethod
     def _append_trimmed(

@@ -90,11 +90,13 @@ class DrawdownCircuitBreaker:
         now = now or datetime.now(timezone.utc)
         if now.date() != self._session_date:
             logger.warning(
-                "circuit_breaker.stale_session",
-                session_date=str(self._session_date),
-                now_date=str(now.date()),
-                msg="update() called on a new calendar day without reset_session()",
+                "circuit_breaker.auto_session_reset",
+                old_session_date=str(self._session_date),
+                new_session_date=str(now.date()),
+                starting_equity=current_equity,
+                msg="update() detected a new calendar day; auto-resetting session",
             )
+            self.reset_session(current_equity, session_date=now.date())
 
         self._peak_equity = max(self._peak_equity, current_equity)
 
