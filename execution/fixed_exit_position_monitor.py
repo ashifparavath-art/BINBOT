@@ -27,11 +27,19 @@ levels itself every few seconds.
 
 Peak profit per position is persisted to disk, so a restart doesn't lose
 an already-reached breakeven / trailing level.
+
+Optional (used by BINBOT1 Phase 1 Option C, off by default for BINBOT2):
+- `max_hold_s` > 0: close any position at market once it has been open
+  that long. Open time = when this monitor first saw the position,
+  persisted to `opened_path` so a restart doesn't reset the clock.
+- `opened_at()` / `last_closed_at(symbol)` expose open and close times so
+  the scanner can apply its young-position limit and re-entry pause.
 """
 from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -83,6 +91,8 @@ class FixedExitPositionMonitor(PositionMonitor):
         take_profit_pct: float = 0.0,
         ladder: ProfitLadder | None = None,
         peaks_path: str | None = None,
+        max_hold_s: float = 0.0,
+        opened_path: str | None = None,
         **kwargs: Any,
     ) -> None:
         # The parent requires trailing-profit parameters; they're unused here
@@ -101,6 +111,48 @@ class FixedExitPositionMonitor(PositionMonitor):
         # key "SYMBOL|SIDE|entry" -> peak profit % of notional
         self._peaks: dict[str, float] = self._load_peaks()
         self._stops = NativeStopManager(self._broker)
+        self._max_hold_s = max_hold_s
+        self._opened_path = Path(opened_path) if opened_path else None
+        # key "SYMBOL|SIDE|entry" -> unix time the position was first seen
+        self._opened: dict[str, float] = self._load_json(self._opened_path)
+        self._closed_at: dict[str, float] = {}  # symbol -> unix time it was last seen closed
+
+    # ---- open / close times -------------------------------------------------
+
+    def opened_at(self) -> dict[str, float]:
+        """symbol -> unix time each currently open position was first seen."""
+        out: dict[str, float] = {}
+        for key, ts in self._opened.items():
+            sym = key.split("|", 1)[0]
+            if sym in self._positions:
+                out[sym] = ts
+        return out
+
+    def last_closed_at(self, symbol: str) -> float | None:
+        return self._closed_at.get(symbol)
+
+    @staticmethod
+    def _load_json(path: Path | None) -> dict[str, float]:
+        if path is None or not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            return {str(k): float(v) for k, v in raw.items()}
+        except Exception as exc:
+            logger.error("fixed_exit_monitor.json_load_failed", path=str(path), error=str(exc))
+            return {}
+
+    @staticmethod
+    def _save_json(path: Path | None, data: dict[str, float]) -> None:
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.error("fixed_exit_monitor.json_save_failed", path=str(path), error=str(exc))
 
     def start(self) -> None:
         super().start()
@@ -113,6 +165,7 @@ class FixedExitPositionMonitor(PositionMonitor):
                 take_profit="profit ladder (no fixed TP)",
                 ladder=self._ladder.describe(),
                 peaks_restored=len(self._peaks),
+                max_hold_hours=round(self._max_hold_s / 3600.0, 2) if self._max_hold_s > 0 else "off",
             )
         else:
             logger.info(
@@ -202,13 +255,26 @@ class FixedExitPositionMonitor(PositionMonitor):
         self._positions = {d.symbol: (d.quantity if d.side is OrderSide.BUY else -d.quantity) for d in details}
 
         peaks_changed = False
+        opened_changed = False
         live_keys = set()
+        now_wall = time.time()
         for detail in details:
             key = self._key(detail)
             live_keys.add(key)
+            if key not in self._opened:
+                self._opened[key] = now_wall
+                opened_changed = True
             if detail.symbol in self._closing:
                 continue
             pnl = detail.unrealized_pnl
+            if self._max_hold_s > 0 and now_wall - self._opened[key] >= self._max_hold_s:
+                hours = (now_wall - self._opened[key]) / 3600.0
+                await self._close_position(
+                    detail.symbol,
+                    self._positions[detail.symbol],
+                    reason=f"MAX-HOLD: open {hours:.1f} h >= {self._max_hold_s / 3600.0:g} h ({pnl:+.2f} USDT)",
+                )
+                continue
             if self._ladder is not None:
                 notional = self._notional(detail)
                 if notional <= 0:
@@ -231,7 +297,8 @@ class FixedExitPositionMonitor(PositionMonitor):
                             stop_pct=level,
                         )
                 if pnl_pct <= level:
-                    kind = "STOP-LOSS" if level < 0 else ("BREAKEVEN-STOP" if level == 0 else "TRAILING-STOP")
+                    kind = ("STOP-LOSS" if level <= -initial_sl_pct + 1e-9 else
+                            "BREAKEVEN-STOP" if level == 0 else "TRAILING-STOP")
                     await self._close_position(
                         detail.symbol,
                         self._positions[detail.symbol],
@@ -270,8 +337,14 @@ class FixedExitPositionMonitor(PositionMonitor):
             del self._peaks[k]
         if stale or peaks_changed:
             self._save_peaks()
+        stale_opened = [k for k in self._opened if k not in live_keys]
+        for k in stale_opened:
+            del self._opened[k]
+        if stale_opened or opened_changed:
+            self._save_json(self._opened_path, self._opened)
 
         for symbol in previous_symbols - current_symbols:
+            self._closed_at[symbol] = now_wall
             await self._disarm_native_stop(symbol)
 
         # Leftover stops on symbols with no position (e.g. from before a restart).

@@ -28,6 +28,11 @@ logger = get_logger(__name__)
 @dataclass
 class DailyLossCircuitBreaker(DrawdownCircuitBreaker):
     max_daily_loss_usdt: float = field(default=100.0, kw_only=True)
+    # True (BINBOT2 default): loss = max(drop from day start, give-back from
+    # the day's high). False (BINBOT1): only the drop from the day's
+    # starting balance counts, so giving back open profit on a good day
+    # can't trip the halt.
+    include_peak_giveback: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -52,7 +57,7 @@ class DailyLossCircuitBreaker(DrawdownCircuitBreaker):
 
         loss_from_start = self.starting_equity - current_equity
         loss_from_peak = self._peak_equity - current_equity
-        loss = max(loss_from_start, loss_from_peak)
+        loss = max(loss_from_start, loss_from_peak) if self.include_peak_giveback else loss_from_start
         if loss >= self.max_daily_loss_usdt:
             self._halted = True
             self._halt_reason = (

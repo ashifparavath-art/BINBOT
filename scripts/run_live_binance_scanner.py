@@ -39,10 +39,12 @@ from data.binance_universe_feed import BinanceUniverseFeed
 from data.storage import MarketDataStore
 from execution.binance_broker import BinanceFuturesBroker
 from execution.order_manager import OrderLifecycleManager
+from execution.fixed_exit_position_monitor import FixedExitPositionMonitor, ProfitLadder
 from execution.position_monitor import PositionMonitor
 from execution.trade_tracker import TradeTracker
 from notifications.telegram_notifier import TelegramNotifier
 from risk.circuit_breaker import DrawdownCircuitBreaker
+from risk.daily_loss_circuit_breaker import DailyLossCircuitBreaker
 from utils.daily_log import DailyJsonlLog
 from risk.margin import MarginCalculator, MarginRequirement
 from risk.risk_engine import RiskEngine
@@ -112,9 +114,19 @@ async def main() -> None:
     scanner_db_path = str(Path(settings.data.duckdb_path).with_name("market_data_scanner.duckdb"))
     store = MarketDataStore(scanner_db_path)
 
-    circuit_breaker = DrawdownCircuitBreaker(
-        max_daily_drawdown_pct=settings.risk.max_daily_drawdown_pct, starting_equity=1.0
-    )
+    if sset.max_daily_loss_usdt > 0:
+        # Fixed USDT daily halt (SCANNER_MAX_DAILY_LOSS_USDT), measured from
+        # the day's starting balance only (open-profit give-back ignored).
+        circuit_breaker: DrawdownCircuitBreaker = DailyLossCircuitBreaker(
+            max_daily_drawdown_pct=100.0,
+            starting_equity=1.0,
+            max_daily_loss_usdt=sset.max_daily_loss_usdt,
+            include_peak_giveback=False,
+        )
+    else:
+        circuit_breaker = DrawdownCircuitBreaker(
+            max_daily_drawdown_pct=settings.risk.max_daily_drawdown_pct, starting_equity=1.0
+        )
     margin_calc = MarginCalculator(
         initial_margin_buffer_pct=settings.risk.initial_margin_buffer_pct,
         maintenance_margin_buffer_pct=settings.risk.maintenance_margin_buffer_pct,
@@ -224,7 +236,9 @@ async def main() -> None:
         broker=broker,
         order_manager=order_manager,
         circuit_breaker=circuit_breaker,
-        max_daily_loss_usd=settings.risk.max_daily_drawdown_pct / 100.0 * (await broker.get_account_equity()),
+        max_daily_loss_usd=sset.max_daily_loss_usdt
+        if sset.max_daily_loss_usdt > 0
+        else settings.risk.max_daily_drawdown_pct / 100.0 * (await broker.get_account_equity()),
         max_position_contracts=sset.max_open_positions,
         chart_symbol=DASHBOARD_CHART_SYMBOL,
         strategy_id="funding-momentum-scanner",
@@ -271,6 +285,23 @@ async def main() -> None:
     # window(s) leading up to this process starting.
     await universe_feed.backfill(broker.client, universe)
     await universe_feed.start()
+    logger.info(
+        "scanner.config",
+        direction=sset.trade_direction,
+        price_jump_pct=sset.price_jump_pct,
+        price_jump_window_min=sset.price_jump_window_min,
+        funding_trend_window_min=sset.funding_trend_window_min,
+        notional_usdt=sset.order_notional_usdt,
+        leverage=sset.leverage,
+        max_open_positions=sset.max_open_positions,
+        max_young_positions=sset.max_young_positions or "off",
+        reentry_pause_s=sset.reentry_pause_s,
+        exit="ladder" if sset.ladder_enabled else "roi-trailing (legacy)",
+        stop_loss=f"{sset.stop_loss_pct:g}% of notional" if sset.ladder_enabled else f"{sset.stop_loss_usdt:g} USDT",
+        max_hold_hours=sset.max_hold_hours or "off",
+        daily_halt=f"{sset.max_daily_loss_usdt:g} USDT" if sset.max_daily_loss_usdt > 0
+        else f"{settings.risk.max_daily_drawdown_pct:g}%",
+    )
 
     async def on_position_close(symbol: str, reason: str) -> None:
         # Recorded before the closing order is even submitted, so it's in
@@ -282,21 +313,52 @@ async def main() -> None:
             level="risk", source="position_monitor", message=f"{symbol}: {reason}"
         )
 
-    position_monitor = PositionMonitor(
-        broker,
-        order_manager,
-        stop_loss_usdt=sset.stop_loss_usdt,
-        margin_usdt=sset.margin_usdt,
-        trailing_profit_arm_roi_pct=sset.trailing_profit_arm_roi_pct,
-        trailing_profit_base_roi_pct=sset.trailing_profit_base_roi_pct,
-        trailing_profit_step_roi_pct=sset.trailing_profit_step_roi_pct,
-        trailing_profit_step_increment_roi_pct=sset.trailing_profit_step_increment_roi_pct,
-        trailing_profit_max_gap_roi_pct=sset.trailing_profit_max_gap_roi_pct,
-        poll_interval_s=sset.position_monitor_interval_s,
-        on_close_event=on_position_close,
-        event_bus=event_bus,
-        price_lookup=universe_feed.latest_price,
-    )
+    position_monitor: PositionMonitor
+    if sset.ladder_enabled:
+        # Phase 1 Option C (final): stop-loss SCANNER_STOP_LOSS_PCT % of
+        # notional, no fixed take-profit, ladder trail (default: 20 points
+        # behind the peak once the trade has been +15%), optional max hold.
+        # The exchange-side stop follows the ladder (NativeStopManager).
+        position_monitor = FixedExitPositionMonitor(
+            broker,
+            order_manager,
+            stop_loss_usdt=sset.stop_loss_usdt,
+            take_profit_usdt=1e12,  # unused while the ladder is on
+            stop_loss_pct=sset.stop_loss_pct,
+            ladder=ProfitLadder(
+                # breakeven step folded into the trail start, so the ladder
+                # goes straight from -stop_loss_pct to the trail.
+                breakeven_trigger_pct=sset.ladder_trail_start_pct,
+                breakeven_lock_pct=sset.ladder_trail_start_lock_pct,
+                trail_start_pct=sset.ladder_trail_start_pct,
+                trail_start_lock_pct=sset.ladder_trail_start_lock_pct,
+                trail_step_pct=sset.ladder_trail_step_pct,
+                trail_step_lock_pct=sset.ladder_trail_step_lock_pct,
+            ),
+            peaks_path="data_store/binbot1_position_peaks.json",
+            max_hold_s=sset.max_hold_hours * 3600.0,
+            opened_path="data_store/binbot1_position_opened.json",
+            poll_interval_s=sset.position_monitor_interval_s,
+            on_close_event=on_position_close,
+            event_bus=event_bus,
+            price_lookup=universe_feed.latest_price,
+        )
+    else:
+        position_monitor = PositionMonitor(
+            broker,
+            order_manager,
+            stop_loss_usdt=sset.stop_loss_usdt,
+            margin_usdt=sset.margin_usdt,
+            trailing_profit_arm_roi_pct=sset.trailing_profit_arm_roi_pct,
+            trailing_profit_base_roi_pct=sset.trailing_profit_base_roi_pct,
+            trailing_profit_step_roi_pct=sset.trailing_profit_step_roi_pct,
+            trailing_profit_step_increment_roi_pct=sset.trailing_profit_step_increment_roi_pct,
+            trailing_profit_max_gap_roi_pct=sset.trailing_profit_max_gap_roi_pct,
+            poll_interval_s=sset.position_monitor_interval_s,
+            on_close_event=on_position_close,
+            event_bus=event_bus,
+            price_lookup=universe_feed.latest_price,
+        )
     position_monitor.start()
 
     scanner = FundingMomentumScannerStrategy(
@@ -309,6 +371,10 @@ async def main() -> None:
             max_open_positions=sset.max_open_positions,
             order_notional_usdt=sset.order_notional_usdt,
             price_jump_pct=sset.price_jump_pct,
+            trade_direction=sset.trade_direction,
+            max_young_positions=sset.max_young_positions,
+            young_age_s=sset.young_age_hours * 3600.0,
+            reentry_pause_s=sset.reentry_pause_s,
         ),
         step_size_lookup=broker.get_step_size,
     )

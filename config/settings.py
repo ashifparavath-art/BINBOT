@@ -128,6 +128,36 @@ class ScannerStrategySettings(BaseSettings):
     position_monitor_interval_s: float = 5.0
     universe_refresh_interval_s: float = 3600.0  # re-fetch the symbol list hourly
 
+    # --- Phase 1 Option C (final) — every option below defaults to OFF, so
+    # an .env without them behaves exactly as before. ---
+    # "follow": pump -> LONG, dump -> SHORT.  "fade": pump -> SHORT, dump -> LONG.
+    trade_direction: str = "follow"
+    # Explicit trade size in USDT notional. 0 = margin_usdt x leverage (old behaviour).
+    notional_usdt: float = 0.0
+    # Ladder exit, all % of the position's notional (replaces the ROI
+    # trailing-profit exit when enabled):
+    #   peak < ladder_trail_start_pct  -> stop at -stop_loss_pct
+    #   peak >= ladder_trail_start_pct -> stop at ladder_trail_start_lock_pct,
+    #   +ladder_trail_step_lock_pct for every further +ladder_trail_step_pct of peak.
+    # Defaults = "20 points behind the peak from +15%": 15->-5, 20->0, 30->+10.
+    ladder_enabled: bool = False
+    stop_loss_pct: float = 10.0
+    ladder_trail_start_pct: float = 15.0
+    ladder_trail_start_lock_pct: float = -5.0
+    ladder_trail_step_pct: float = 1.0
+    ladder_trail_step_lock_pct: float = 1.0
+    # Close any position after this many hours. 0 = off.
+    max_hold_hours: float = 0.0
+    # Positions younger than young_age_hours may use at most this many of the
+    # max_open_positions slots. 0 = off (only max_open_positions applies).
+    max_young_positions: int = 0
+    young_age_hours: float = 24.0
+    # Wait this long after a position closes before re-entering the same symbol. 0 = off.
+    reentry_pause_s: float = 0.0
+    # Daily loss halt in USDT (drop from the day's starting balance,
+    # unrealized P&L included). 0 = use RISK_MAX_DAILY_DRAWDOWN_PCT instead.
+    max_daily_loss_usdt: float = 0.0
+
     @field_validator("leverage")
     @classmethod
     def _validate_leverage(cls, v: int) -> int:
@@ -155,8 +185,32 @@ class ScannerStrategySettings(BaseSettings):
             raise ValueError("trailing_profit_base_roi_pct must not exceed trailing_profit_arm_roi_pct")
         return self
 
+    @field_validator("trade_direction")
+    @classmethod
+    def _validate_direction(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"follow", "fade"}:
+            raise ValueError("trade_direction must be 'follow' or 'fade'")
+        return v
+
+    @field_validator("stop_loss_pct")
+    @classmethod
+    def _validate_stop_loss_pct(cls, v: float) -> float:
+        if not (0.0 < v < 100.0):
+            raise ValueError("stop_loss_pct must be in (0, 100)")
+        return v
+
+    @field_validator("ladder_trail_start_pct", "ladder_trail_step_pct")
+    @classmethod
+    def _validate_ladder_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("ladder trigger/step values must be positive")
+        return v
+
     @property
     def order_notional_usdt(self) -> float:
+        if self.notional_usdt > 0:
+            return self.notional_usdt
         return self.margin_usdt * self.leverage
 
 
